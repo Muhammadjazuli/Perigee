@@ -37,6 +37,7 @@ pub mod oracle_guard;
 pub mod reputation;
 pub mod rotation_journal;
 pub mod log_redaction;
+pub mod logging;
 pub mod nonce_partition;
 pub mod two_phase_commit;
 pub mod signed_receipt;

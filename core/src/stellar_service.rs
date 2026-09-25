@@ -47,6 +47,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -74,6 +75,9 @@ pub enum StellarServiceError {
     /// The call timed out (per-call deadline exceeded).
     #[error("RPC call timed out after {timeout_ms}ms to {url}")]
     Timeout { timeout_ms: u64, url: String },
+
+    #[error("RPC call cancelled for {url}")]
+    Cancelled { url: String },
 
     /// A transport-level error (TCP, DNS, TLS …).
     #[error("RPC network error to {url}: {source}")]
@@ -143,7 +147,10 @@ impl StellarServiceError {
     /// Transport failures (timeout, TCP error) don't reflect the provider's
     /// own latency, so we skip them to avoid poisoning the EMA.
     fn should_record_rtt(&self) -> bool {
-        !matches!(self, Self::Timeout { .. } | Self::Network { .. })
+        !matches!(
+            self,
+            Self::Timeout { .. } | Self::Network { .. } | Self::Cancelled { .. }
+        )
     }
 }
 
@@ -275,6 +282,18 @@ impl StellarService {
         method: &str,
         params: Value,
     ) -> Result<Value, StellarServiceError> {
+        let cancellation = CancellationToken::new();
+        self.call_rpc_with_cancellation(provider, method, params, &cancellation)
+            .await
+    }
+
+    pub async fn call_rpc_with_cancellation(
+        &self,
+        provider: &RpcProvider,
+        method: &str,
+        params: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, StellarServiceError> {
         let inner = &*self.0;
         let url = &provider.url;
 
@@ -288,7 +307,12 @@ impl StellarService {
         let mut last_error: Option<StellarServiceError> = None;
 
         for attempt in 1..=inner.config.max_attempts {
-            // Back-off before every retry (not before the first attempt).
+            if cancellation.is_cancelled() {
+                return Err(StellarServiceError::Cancelled {
+                    url: url.clone(),
+                });
+            }
+
             if attempt > 1 {
                 let delay = Self::backoff_delay(&inner.config, attempt);
                 tracing::debug!(
@@ -298,11 +322,20 @@ impl StellarService {
                     method,
                     "Retrying RPC call after back-off"
                 );
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(StellarServiceError::Cancelled {
+                            url: url.clone(),
+                        });
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
 
             let started = std::time::Instant::now();
-            let result = self.do_send(provider, &body).await;
+            let result = self
+                .do_send_with_cancellation(provider, &body, cancellation)
+                .await;
             let rtt_us = started.elapsed().as_micros() as u64;
 
             match result {
@@ -319,6 +352,9 @@ impl StellarService {
                     return Ok(value);
                 }
                 Err(e) => {
+                    if matches!(&e, StellarServiceError::Cancelled { .. }) {
+                        return Err(e);
+                    }
                     if e.should_record_rtt() {
                         inner.registry.record_rtt(url, rtt_us);
                     }
@@ -414,11 +450,11 @@ impl StellarService {
         Ok(())
     }
 
-    /// Execute a single HTTP send without any retry logic.
-    async fn do_send(
+    async fn do_send_with_cancellation(
         &self,
         provider: &RpcProvider,
         body: &Value,
+        cancellation: &CancellationToken,
     ) -> Result<Value, StellarServiceError> {
         let inner = &*self.0;
         let url = &provider.url;
@@ -426,7 +462,6 @@ impl StellarService {
 
         let mut req = inner.client.post(url).json(body);
 
-        // Attach optional API-key / bearer auth headers.
         if let (Some(header), Some(value)) = (
             provider.auth_header.as_deref(),
             provider.auth_value.as_deref(),
@@ -434,25 +469,31 @@ impl StellarService {
             req = req.header(header, value);
         }
 
-        let response = tokio::time::timeout(timeout, req.send())
-            .await
-            .map_err(|_| StellarServiceError::Timeout {
-                timeout_ms: timeout.as_millis() as u64,
-                url: url.clone(),
-            })?
-            .map_err(|e| {
-                if e.is_timeout() {
-                    StellarServiceError::Timeout {
-                        timeout_ms: timeout.as_millis() as u64,
-                        url: url.clone(),
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(StellarServiceError::Cancelled {
+                    url: url.clone(),
+                });
+            }
+            result = tokio::time::timeout(timeout, req.send()) => result
+                .map_err(|_| StellarServiceError::Timeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                    url: url.clone(),
+                })
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        StellarServiceError::Timeout {
+                            timeout_ms: timeout.as_millis() as u64,
+                            url: url.clone(),
+                        }
+                    } else {
+                        StellarServiceError::Network {
+                            url: url.clone(),
+                            source: e,
+                        }
                     }
-                } else {
-                    StellarServiceError::Network {
-                        url: url.clone(),
-                        source: e,
-                    }
-                }
-            })?;
+                }),
+        }?;
 
         let status = response.status();
         if !status.is_success() {
@@ -462,13 +503,15 @@ impl StellarService {
             });
         }
 
-        response
-            .json::<Value>()
-            .await
-            .map_err(|e| StellarServiceError::ParseError {
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(StellarServiceError::Cancelled {
+                url: url.clone(),
+            }),
+            result = response.json::<Value>() => result.map_err(|e| StellarServiceError::ParseError {
                 url: url.clone(),
                 source: e,
-            })
+            }),
+        }
     }
 
     /// Compute the back-off delay for `attempt` (1-based) with ±25% jitter.
