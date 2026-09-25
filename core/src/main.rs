@@ -3,8 +3,12 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod agent_fleet;
+mod agent_health;
+mod agent_identity;
 mod audit_log;
 mod auth;
+mod backpressure;
 mod benchmarks;
 mod billing_service;
 mod cache;
@@ -16,15 +20,18 @@ mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
+mod failover;
 mod gas_golfing;
 mod middleware;
 pub mod insights;
+mod input_sanitization;
 mod jobs;
 mod merkle_tree;
 mod metrics;
 mod parser;
 mod policy_expiry;
 pub mod reconciliation;
+mod reputation;
 mod rounding;
 mod routing;
 pub mod rpc_provider;
@@ -33,6 +40,7 @@ mod secret_hash;
 mod simulation;
 mod simulation_service;
 mod stellar_service;
+mod two_phase_commit;
 pub mod vault_store;
 mod manager_store;
 mod wasm_branch_analysis;
@@ -41,8 +49,9 @@ mod ws;
 use crate::cache::{ContractCache, SimulationCache};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::{AppError, Validate, ValidatedJson};
+use crate::input_sanitization::{SanitizedJson, SanitizedQuery};
 use axum::{
-    extract::{Json, Multipart, Query, State},
+    extract::{Json, Multipart, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -499,6 +508,7 @@ pub struct AppState {
     reconciliation_repo: db::reconciliation::ReconciliationRepo,
     /// White-label vault records with optimistic locking (API-37).
     vault_store: Arc<vault_store::VaultStore>,
+    agent_fleet: Arc<agent_fleet::DefaultAgentFleet>,
     /// Manager onboarding with approval/KYC gate (API-33).
     manager_store: Arc<manager_store::ManagerStore>,
 }
@@ -740,7 +750,7 @@ pub struct OptimizeLimitsResponse {
 // ── Fee Market Types ─────────────────────────────────────────────────────
 
 /// Request body for fee recommendation endpoint
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct FeeRecommendationRequest {
     /// Desired inclusion speed: "next_ledger", "next_3_ledgers", "economy", "standard", "priority"
     #[schema(example = "priority")]
@@ -773,7 +783,7 @@ pub struct FeeRecommendationResponse {
 }
 
 /// Request for historical fee data
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct FeeHistoryRequest {
     /// Number of recent ledgers to retrieve (default 50)
     #[schema(example = 50)]
@@ -1362,12 +1372,11 @@ async fn compare_handler(
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "mode" => {
-                mode_str = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| AppError::BadRequest(format!("Invalid mode field: {}", e)))?,
-                );
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::BadRequest(format!("Invalid mode field: {}", e)))?;
+                mode_str = Some(input_sanitization::sanitize_multipart_text(&value, "mode")?);
             }
             "current_wasm" => {
                 current_wasm_bytes = Some(
@@ -1392,23 +1401,34 @@ async fn compare_handler(
                 );
             }
             "contract_id" => {
-                contract_id =
-                    Some(field.text().await.map_err(|e| {
-                        AppError::BadRequest(format!("Invalid contract_id: {}", e))
-                    })?);
+                let value = field.text().await.map_err(|e| {
+                    AppError::BadRequest(format!("Invalid contract_id: {}", e))
+                })?;
+                contract_id = Some(input_sanitization::sanitize_multipart_text(
+                    &value,
+                    "contract_id",
+                )?);
             }
             "function_name" => {
-                function_name =
-                    Some(field.text().await.map_err(|e| {
-                        AppError::BadRequest(format!("Invalid function_name: {}", e))
-                    })?);
+                let value = field.text().await.map_err(|e| {
+                    AppError::BadRequest(format!("Invalid function_name: {}", e))
+                })?;
+                function_name = Some(input_sanitization::sanitize_multipart_text(
+                    &value,
+                    "function_name",
+                )?);
             }
             "args" => {
                 let args_json = field
                     .text()
                     .await
                     .map_err(|e| AppError::BadRequest(format!("Invalid args: {}", e)))?;
-                args = serde_json::from_str(&args_json).unwrap_or_default();
+                let args_value: serde_json::Value = serde_json::from_str(&args_json)
+                    .map_err(|e| AppError::BadRequest(format!("Invalid args JSON: {}", e)))?;
+                let args_value = input_sanitization::sanitize_json(&args_value)
+                    .map_err(input_sanitization::sanitization_error)?;
+                args = serde_json::from_value(args_value)
+                    .map_err(|e| AppError::BadRequest(format!("Invalid args: {}", e)))?;
             }
             _ => { /* ignore unknown fields */ }
         }
@@ -1609,7 +1629,7 @@ async fn analyze_gas_golfing(
 )]
 async fn fee_recommend(
     State(state): State<Arc<AppState>>,
-    Query(req): Query<FeeRecommendationRequest>,
+    SanitizedQuery(req): SanitizedQuery<FeeRecommendationRequest>,
 ) -> Result<Json<FeeRecommendationResponse>, AppError> {
     tracing::info!("Generating fee recommendation");
 
@@ -1651,7 +1671,7 @@ async fn fee_recommend(
 )]
 async fn fee_history(
     State(state): State<Arc<AppState>>,
-    Query(req): Query<FeeHistoryRequest>,
+    SanitizedQuery(req): SanitizedQuery<FeeHistoryRequest>,
 ) -> Result<Json<FeeHistoryResponse>, AppError> {
     tracing::info!("Fetching fee history");
 
@@ -1827,8 +1847,9 @@ async fn ready_check(State(state): State<Arc<AppState>>) -> axum::response::Resp
         .is_ok();
         
     let rpc_ok = !state.provider_registry.healthy_providers().await.is_empty();
+    let agents_ok = state.agent_fleet.is_operational("server");
 
-    if db_ok && rpc_ok {
+    if db_ok && rpc_ok && agents_ok {
         (axum::http::StatusCode::OK, "OK").into_response()
     } else {
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").into_response()
@@ -1849,7 +1870,7 @@ async fn registry_peers(
 
 async fn registry_gossip(
     State(state): State<Arc<AppState>>,
-    Json(snapshot): Json<RegistrySnapshot>,
+    SanitizedJson(snapshot): SanitizedJson<RegistrySnapshot>,
 ) -> Json<RegistrySnapshot> {
     state.provider_registry.merge_snapshot(snapshot).await;
     Json(state.provider_registry.registry_snapshot().await)
@@ -2335,6 +2356,13 @@ async fn main() {
         .expect("Failed to initialize job queue");
     // ── WebSocket event bus ─────────────────────────────────────────────
     let simulation_bus = SimulationBus::new();
+    let agent_fleet = Arc::new(agent_fleet::DefaultAgentFleet::new());
+    if agent_fleet
+        .register_with_threshold(agent_fleet::AgentIdentity::new("api-server".to_string()), 0)
+        .is_ok()
+    {
+        agent_fleet.record_self_report("api-server");
+    }
 
     let insights_cache = crate::cache::InsightsCache::new();
     let job_worker = JobWorker::new(
@@ -2458,6 +2486,7 @@ async fn main() {
         reconciler,
         reconciliation_repo,
         vault_store,
+        agent_fleet,
         manager_store,
     });
 
@@ -2562,6 +2591,9 @@ async fn main() {
             crate::middleware::api_version_middleware,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(
+            input_sanitization::sanitize_request_middleware,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 2)) // 2 MB limit
         .with_state(app_state); // ← thread AppState through all handlers
 
@@ -3043,7 +3075,7 @@ mod tests {
 
 async fn analyze_simulation(
     State(simulation_service): State<Arc<SimulationService>>,
-    Json(metric): Json<SimulationMetric>,
+    SanitizedJson(metric): SanitizedJson<SimulationMetric>,
 ) -> Result<Json<AnalysisResult>, AppError> {
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))

@@ -15,12 +15,13 @@
 //! places) in a future iteration.
 
 use crate::db;
+use crate::input_sanitization::{SanitizedJson, SanitizedPath, SanitizedQuery};
 use std::str::FromStr;
 use crate::fee_analytics::FeeAnalyticsEngine;
 use crate::fee_store::FeeStore;
 use crate::AppError;
 use axum::{
-    extract::{Path, Query, State},
+    extract::State,
     http::StatusCode,
     Json,
 };
@@ -295,7 +296,7 @@ impl From<ReconciliationError> for AppError {
 )]
 pub async fn reconcile_handler(
     State(state): State<Arc<crate::AppState>>,
-    Json(req): Json<ReconcileRequest>,
+    SanitizedJson(req): SanitizedJson<ReconcileRequest>,
 ) -> Result<(StatusCode, Json<ReconcileResponse>), AppError> {
     if req.from_ledger >= req.to_ledger {
         return Err(AppError::BadRequest(
@@ -346,7 +347,7 @@ pub async fn reconcile_handler(
 )]
 pub async fn get_reconcile_job_handler(
     State(state): State<Arc<crate::AppState>>,
-    Path(job_id): Path<String>,
+    SanitizedPath(job_id): SanitizedPath<String>,
 ) -> Result<Json<crate::jobs::Job>, AppError> {
     let id = crate::jobs::JobId::from_str(&job_id)
         .map_err(|_| AppError::BadRequest("Invalid job ID".into()))?;
@@ -375,7 +376,7 @@ pub async fn get_reconcile_job_handler(
 )]
 pub async fn list_reports_handler(
     State(state): State<Arc<crate::AppState>>,
-    Query(params): Query<ListReportsQuery>,
+    SanitizedQuery(params): SanitizedQuery<ListReportsQuery>,
 ) -> Result<Json<Vec<ReconciliationReport>>, AppError> {
     let reports = state
         .reconciliation_repo
