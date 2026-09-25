@@ -222,6 +222,7 @@ impl From<SimulationError> for AppError {
 
             // Server errors (HTTP 500)
             SimulationError::NodeTimeout => AppError::Internal("RPC request timed out".to_string()),
+            SimulationError::Cancelled => AppError::Internal("Request cancelled".to_string()),
             SimulationError::RpcRequestFailed(msg) => {
                 AppError::Internal(format!("RPC request failed: {}", msg))
             }
